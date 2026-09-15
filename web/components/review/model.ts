@@ -58,6 +58,10 @@ export interface AssetChange {
   where: string
   /** The CAIP-19 id, so the row can find its icon. */
   assetId: string
+  /** The CAIP-2 chain the row is on. A bridge's arriving row is not on the plan's chain. */
+  chainId: string
+  /** A quote's expectation rather than a figure — the row reads "about". */
+  estimate?: boolean
 }
 
 /**
@@ -75,7 +79,11 @@ export interface AssetChange {
 export function assetChanges(plan: Plan, live?: Simulation | null): AssetChange[] {
   const holder = holderOf(plan)
   const traced = (live ?? plan.simulation)?.assetChanges ?? []
-  if (traced.length > 0) return traced.map((delta) => observedRow(delta, holder))
+  // A simulation runs on the chain that signs. What a bridge delivers lands
+  // on another chain, which no run here can see — so that row stays, from
+  // the quote, beneath whatever was observed. Without it the page showed
+  // the money leaving and nothing arriving the moment a simulation landed.
+  if (traced.length > 0) return [...traced.map((delta) => observedRow(delta, holder)), ...arrival(plan)]
 
   if (plan.intent.kind === 'transfer') {
     const words = assetWords(plan, plan.intent.asset)
@@ -87,6 +95,7 @@ export function assetChanges(plan: Plan, live?: Simulation | null): AssetChange[
         symbol: words.symbol,
         where: `leaves ${holder}`,
         assetId: plan.intent.asset,
+        chainId: chainOfAsset(plan.intent.asset),
       },
     ]
   }
@@ -101,7 +110,7 @@ export function assetChanges(plan: Plan, live?: Simulation | null): AssetChange[
    * expectation, not an observation.
    */
   if (plan.intent.kind === 'swap' || plan.intent.kind === 'bridge') {
-    const { from, to, amountIn } = plan.intent
+    const { from, amountIn } = plan.intent
     const rows: AssetChange[] = []
     const paid = assetWords(plan, from)
     if (paid && amountIn) {
@@ -111,21 +120,10 @@ export function assetChanges(plan: Plan, live?: Simulation | null): AssetChange[
         symbol: paid.symbol,
         where: `leaves ${holder}`,
         assetId: from,
+        chainId: chainOfAsset(from),
       })
     }
-    const got = assetWords(plan, to)
-    const expected = plan.quote.expectedOut
-    if (got && expected) {
-      const crossing = chainOfAsset(to) !== chainOfAsset(from)
-      rows.push({
-        direction: 'in',
-        amount: formatAmount(expected, got.decimals),
-        symbol: got.symbol,
-        where: crossing ? `arrives on ${chainName(chainOfAsset(to))}` : `arrives in ${holder}`,
-        assetId: to,
-      })
-    }
-    return rows
+    return [...rows, ...expectedIn(plan, holder)]
   }
 
   /**
@@ -145,11 +143,39 @@ export function assetChanges(plan: Plan, live?: Simulation | null): AssetChange[
         symbol: words.symbol,
         where: `at most, leaves ${holder}`,
         assetId: change.asset,
+        chainId: chainOfAsset(change.asset),
       })
     }
     return rows
   }
   return []
+}
+
+/** What a trade's quote says arrives: on the plan's chain for a swap, elsewhere for a bridge. */
+function expectedIn(plan: Plan, holder: string): AssetChange[] {
+  if (plan.intent.kind !== 'swap' && plan.intent.kind !== 'bridge') return []
+  const { from, to } = plan.intent
+  const got = assetWords(plan, to)
+  const expected = plan.quote.expectedOut
+  if (!got || !expected) return []
+  const crossing = chainOfAsset(to) !== chainOfAsset(from)
+  return [
+    {
+      direction: 'in',
+      amount: formatAmount(expected, got.decimals),
+      symbol: got.symbol,
+      // The same wallet receives on the far chain; saying so is the address the row was missing.
+      where: crossing ? `arrives on ${chainName(chainOfAsset(to))} in ${holder}` : `arrives in ${holder}`,
+      assetId: to,
+      chainId: chainOfAsset(to),
+      estimate: true,
+    },
+  ]
+}
+
+/** The bridge's far side, which a simulation on the signing chain cannot observe. */
+function arrival(plan: Plan): AssetChange[] {
+  return plan.intent.kind === 'bridge' ? expectedIn(plan, holderOf(plan)) : []
 }
 
 /**
@@ -215,6 +241,7 @@ function observedRow(delta: AssetDelta, holder: string): AssetChange {
     symbol: delta.symbol ?? 'units',
     where: out ? `leaves ${holder}` : `arrives in ${holder}`,
     assetId: delta.assetId,
+    chainId: chainOfAsset(delta.assetId),
   }
 }
 
@@ -324,15 +351,29 @@ export interface Approval {
   spender: string
   amount: string
   unlimited: boolean
-  /** The token being approved — the call's target — as a CAIP-19 id. */
+  /** The token being approved as a CAIP-19 id: the call's target, or the token a Permit2 grant names. */
   asset: string
   /** What the decoder called the spender, when it is one of the plan's own targets. */
   spenderName: string | null
+  /** Set when the allowance is a Permit2 grant: the token was approved to Permit2, and Permit2 lets this spender draw it. */
+  throughPermit2: boolean
+}
+
+/**
+ * Permit2's own approve. The target is Permit2 rather than the token, so the
+ * token is the first argument, and the spender the second.
+ */
+const PERMIT2_APPROVE = 'approve(address,address,uint160,uint48)'
+
+/** The token an approval is on, as a CAIP-19 id. */
+export function approvedAsset(plan: Plan, action: DecodedAction): string {
+  const chain = chainOfPlan(plan)
+  const token = action.function === PERMIT2_APPROVE ? (action.args[0]?.value ?? addressOf(action.target)) : addressOf(action.target)
+  return `${chain}/erc20:${token.toLowerCase()}`
 }
 
 /** The approvals a plan carries, for the heads-up. */
 export function approvals(plan: Plan): Approval[] {
-  const chain = chainOfPlan(plan)
   return plan.decodedActions.flatMap((a) =>
     a.approval
       ? [
@@ -340,10 +381,11 @@ export function approvals(plan: Plan): Approval[] {
             spender: a.approval.spender,
             amount: a.approval.amount,
             unlimited: a.approval.amount === 'unlimited',
-            asset: `${chain}/erc20:${addressOf(a.target).toLowerCase()}`,
+            asset: approvedAsset(plan, a),
             spenderName:
               plan.decodedActions.find((b) => addressOf(b.target).toLowerCase() === addressOf(a.approval!.spender).toLowerCase())
                 ?.contractName ?? null,
+            throughPermit2: a.function === PERMIT2_APPROVE,
           },
         ]
       : [],
@@ -494,6 +536,11 @@ export interface PlanStep {
  */
 const ADDED_STEP = /^(At least |Note from the request:|[a-z]+ estimates |[a-z]+ does not estimate )/
 
+function wordsForSpent(plan: Plan): AssetWords | null {
+  const spent = sourceAssetIdOf(plan)
+  return spent === null ? null : assetWords(plan, spent)
+}
+
 export function planSteps(plan: Plan): PlanStep[] {
   if (plan.outcome.type !== 'calls') return []
   const calls = plan.outcome.calls
@@ -504,18 +551,24 @@ export function planSteps(plan: Plan): PlanStep[] {
     const index = i + 1
 
     if (action?.approval) {
-      const spent = sourceAssetIdOf(plan)
-      const words = spent === null ? null : assetWords(plan, spent)
+      const words = assetWords(plan, approvedAsset(plan, action)) ?? wordsForSpent(plan)
       const amount =
         action.approval.amount === 'unlimited'
           ? 'unlimited'
           : words
             ? `${formatAmount(action.approval.amount, words.decimals)} ${words.symbol}`
             : action.approval.amount
+      // The spender by the name the decoder gave it when it is one of the
+      // plan's own targets — "for Permit2", "for UniversalRouter" — and by
+      // its address otherwise. A Permit2 grant says so, since it is the
+      // second half of one allowance rather than a second one.
+      const spender = addressOf(action.approval.spender).toLowerCase()
+      const named = plan.decodedActions.find((b) => addressOf(b.target).toLowerCase() === spender)?.contractName
+      const through = action.function === PERMIT2_APPROVE ? ' through Permit2' : ''
       return {
         index,
         label: `Approve ${amount}`,
-        detail: `for ${truncateAddress(addressOf(action.approval.spender))}`,
+        detail: `for ${named ?? truncateAddress(spender)}${through}`,
       }
     }
 

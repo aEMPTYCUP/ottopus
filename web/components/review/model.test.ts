@@ -103,7 +103,7 @@ describe('status on the page', () => {
 
 describe('what the page says', () => {
   it('shows the outgoing amount in the asset’s own words', () => {
-    expect(assetChanges(plan)).toEqual([{ assetId: `${BASE}/erc20:${USDC}`, direction: 'out', amount: '500', symbol: 'USDC', where: 'leaves Main' }])
+    expect(assetChanges(plan)).toEqual([{ assetId: `${BASE}/erc20:${USDC}`, chainId: BASE, direction: 'out', amount: '500', symbol: 'USDC', where: 'leaves Main' }])
   })
 
   it('shows nothing rather than guessing when the plan recorded no asset words', () => {
@@ -191,7 +191,7 @@ describe('what the simulation observed', () => {
     const page = simulated()
     expect(changeSource(page)).toBe('stored')
     expect(assetChanges(page)).toEqual([
-      { assetId: `${BASE}/erc20:${USDC}`, direction: 'out', amount: '500', symbol: 'USDC', where: 'leaves Main' },
+      { assetId: `${BASE}/erc20:${USDC}`, chainId: BASE, direction: 'out', amount: '500', symbol: 'USDC', where: 'leaves Main' },
     ])
   })
 
@@ -212,6 +212,34 @@ describe('what the simulation observed', () => {
       'out 500 USDC leaves Main',
       'in 0.002 ETH arrives in Main',
     ])
+  })
+
+  it('keeps a bridge’s far side from the quote beneath what was observed', () => {
+    const BNB = 'eip155:56'
+    const USDT = '0x55d398326f99059ff775485246999027b3197955'
+    const bridge: Plan = {
+      ...simulated({
+        chainId: BNB,
+        assetChanges: [{ assetId: `${BNB}/erc20:${USDT}`, symbol: 'USDT', decimals: 18, diff: '-41750000000000000000', pre: '41750000000000000000', post: '0' }],
+      }),
+      intent: { kind: 'bridge', from: `${BNB}/erc20:${USDT}`, to: `${BASE}/erc20:${USDC}`, amountIn: '41750000000000000000', slippageBps: 50 },
+      quote: { provider: 'lifi', expiresAt: '2026-09-09T16:32:59Z', expectedOut: '41634022', minOut: '41425852' },
+      resolution: { ...plan.resolution, account: { caip10: `${BNB}:${plan.resolution.account.caip10.split(':')[2]}`, label: 'Main' } },
+      humanPlan: {
+        ...plan.humanPlan,
+        assets: [
+          { id: `${BNB}/erc20:${USDT}`, symbol: 'USDT', decimals: 18 },
+          { id: `${BASE}/erc20:${USDC}`, symbol: 'USDC', decimals: 6 },
+        ],
+      },
+    } as Plan
+    expect(assetChanges(bridge).map((c) => `${c.direction} ${c.amount} ${c.symbol} ${c.chainId} ${c.where}${c.estimate ? ' (about)' : ''}`)).toEqual([
+      'out 41.75 USDT eip155:56 leaves Main',
+      'in 41.634022 USDC eip155:8453 arrives on Base in Main (about)',
+    ])
+    // Before any run, the same two rows, both from the request.
+    const unrun = { ...bridge, simulation: null } as Plan
+    expect(assetChanges(unrun).map((c) => c.chainId)).toEqual([BNB, BASE])
   })
 
   it('shows a token it could not name in that token’s own units', () => {
@@ -367,6 +395,69 @@ describe('what a half-signed swap would leave behind', () => {
   it('has nothing to say about a plan that approves nothing', () => {
     expect(standingApproval(plan)).toBeNull()
   })
+
+  /**
+   * An allowance through Permit2 is two approvals on the page: the token
+   * to Permit2, then Permit2's grant to the router. The grant's target is
+   * Permit2, not the token, so the token comes from its first argument.
+   */
+  it('names a Permit2 grant in the token’s words, and the spender it is for', () => {
+    const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3'
+    const permit2Swap: Plan = {
+      ...swap({ spender: `${BASE}:${PERMIT2}`, amount: '500000000' }),
+      outcome: {
+        type: 'calls',
+        calls: [
+          { to: `${BASE}:${USDC}`, value: '0', data: '0x095ea7b3', chainId: BASE },
+          { to: `${BASE}:${PERMIT2}`, value: '0', data: '0x87517c45', chainId: BASE },
+          { to: `${BASE}:${ROUTER}`, value: '0', data: '0x3593564c', chainId: BASE },
+        ],
+      },
+      humanPlan: { ...plan.humanPlan, steps: ['Swap on Uniswap v3'], assets: [{ id: `${BASE}/erc20:${USDC}`, symbol: 'USDC', decimals: 6 }] },
+      decodedActions: [
+        { ...swap({ spender: `${BASE}:${PERMIT2}`, amount: '500000000' }).decodedActions[0]!, contractName: 'FiatTokenProxy' },
+        {
+          target: `${BASE}:${PERMIT2}`,
+          isContract: true,
+          source: 'abi',
+          verified: true,
+          contractName: 'Permit2',
+          function: 'approve(address,address,uint160,uint48)',
+          args: [
+            { name: 'token', type: 'address', value: USDC },
+            { name: 'spender', type: 'address', value: ROUTER },
+            { name: 'amount', type: 'uint160', value: '500000000' },
+            { name: 'expiration', type: 'uint48', value: '1789240982' },
+          ],
+          value: '0',
+          approval: { spender: `${BASE}:${ROUTER}`, amount: '500000000' },
+        },
+        {
+          target: `${BASE}:${ROUTER}`,
+          isContract: true,
+          source: 'sourcify',
+          verified: true,
+          contractName: 'UniversalRouter',
+          function: 'execute(bytes,bytes[],uint256)',
+          args: [],
+          value: '0',
+        },
+      ],
+    }
+    const grants = approvals(permit2Swap)
+    expect(grants.map((g) => [g.asset, g.spenderName, g.throughPermit2])).toEqual([
+      [`${BASE}/erc20:${USDC}`, 'Permit2', false],
+      [`${BASE}/erc20:${USDC}`, 'UniversalRouter', true],
+    ])
+    expect(approvalAmount(permit2Swap, grants[1]!)).toBe('500 USDC')
+    expect(planSteps(permit2Swap).map((s) => [s.label, s.detail])).toEqual([
+      ['Approve 500 USDC', 'for Permit2'],
+      ['Approve 500 USDC', 'for UniversalRouter through Permit2'],
+      ['Swap on Uniswap v3', undefined],
+    ])
+    // Stopping after the first signature leaves the allowance to Permit2, and nothing to the router.
+    expect(standingApproval(permit2Swap)).toEqual({ spender: `${BASE}:${PERMIT2}`, amount: '500', symbol: 'USDC', unlimited: false })
+  })
 })
 
 describe('a trade with nothing simulated yet', () => {
@@ -392,14 +483,14 @@ describe('a trade with nothing simulated yet', () => {
   it('reads both sides off the request and the quote', () => {
     const rows = assetChanges(trade('swap', `${BASE}/erc20:${DEGEN}`))
     expect(rows).toEqual([
-      { assetId: `${BASE}/erc20:${USDC}`, direction: 'out', amount: '500', symbol: 'USDC', where: 'leaves Main' },
-      { assetId: `${BASE}/erc20:${DEGEN}`, direction: 'in', amount: '9.5', symbol: 'DEGEN', where: 'arrives in Main' },
+      { assetId: `${BASE}/erc20:${USDC}`, chainId: BASE, direction: 'out', amount: '500', symbol: 'USDC', where: 'leaves Main' },
+      { assetId: `${BASE}/erc20:${DEGEN}`, chainId: BASE, direction: 'in', amount: '9.5', symbol: 'DEGEN', where: 'arrives in Main', estimate: true },
     ])
   })
 
   it('names the destination chain when the trade crosses one', () => {
     const rows = assetChanges(trade('bridge', `eip155:42161/erc20:${DEGEN}`))
-    expect(rows[1]).toMatchObject({ direction: 'in', where: 'arrives on Arbitrum One' })
+    expect(rows[1]).toMatchObject({ direction: 'in', chainId: 'eip155:42161', where: 'arrives on Arbitrum One in Main' })
   })
 
   it('is labelled as the request, because that is what it is', () => {
