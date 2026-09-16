@@ -85,6 +85,10 @@ export function asSimulation(run: SimulationRun, pricing: Pricing = {}): Simulat
     // Carried, not dropped: an empty diff means two different things, and
     // the custom tier refuses a run that never looked.
     tracedAssets: run.tracedAssets,
+    // Carried raw so the policy can decode Transfer events itself. The
+    // balance probes miss ERC-1155, reverting balanceOf, and contract-held
+    // assets; the logs name the from address outright (#100).
+    ...(run.logs ? { logs: run.logs } : {}),
     gasUsed: run.gasUsed,
     gasUsd: gasUsd(run.gasUsed, pricing),
     ...(run.revertReason ? { revertReason: run.revertReason } : {}),

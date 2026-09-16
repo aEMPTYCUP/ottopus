@@ -36,6 +36,13 @@ export interface SimulationRun {
   assetChanges: AssetDelta[]
   /** Whether the balances were traced at all, as opposed to traced and found empty. */
   tracedAssets: boolean
+  /**
+   * Raw EVM logs from the run, for the custom tier to decode Transfer events.
+   *
+   * Balance probes miss ERC-1155, reverting balanceOf, and contract-held
+   * assets; the logs name the from address outright. #100.
+   */
+  logs?: Array<{ address: string; topics: string[]; data: string }>
   revertReason?: string
   /** Which call reverted, 1-based. */
   failedCall?: number

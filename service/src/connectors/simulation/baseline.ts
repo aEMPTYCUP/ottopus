@@ -76,6 +76,17 @@ export function baselineSimulator(options: BaselineOptions = {}): Simulator {
           const failedIndex = result.results.findIndex((r) => r.status === 'failure')
           const failed = failedIndex >= 0 ? result.results[failedIndex] : undefined
           const gasUsed = result.results.reduce((total, r) => total + (r.gasUsed ?? 0n), 0n)
+          // Extract raw EVM logs from every call result. The balance probes
+          // miss ERC-1155 transfers, reverting balanceOf, and contract-held
+          // assets; the logs name the from address outright, so the custom
+          // tier can decode Transfer events itself (#100).
+          const logs = result.results.flatMap((r) =>
+            (r.logs ?? []).map((log) => ({
+              address: log.address.toLowerCase(),
+              topics: log.topics.map((t) => t.toLowerCase()),
+              data: log.data.toLowerCase(),
+            })),
+          )
           const conclusions = {
             chainId: request.chainId,
             blockNumber: (result.block.number ?? 0n).toString(),
@@ -83,6 +94,7 @@ export function baselineSimulator(options: BaselineOptions = {}): Simulator {
             gasUsed: gasUsed.toString(),
             assetChanges: traceAssetChanges ? deltasFrom(result.assetChanges, request.chainId) : [],
             tracedAssets: traceAssetChanges,
+            logs,
             ...(failed?.error ? { revertReason: reasonOf(failed.error) } : {}),
             ...(failedIndex >= 0 ? { failedCall: failedIndex + 1 } : {}),
           }
@@ -143,6 +155,7 @@ async function legacy(
         gasUsed: gasUsed.toString(),
         assetChanges: [],
         tracedAssets: false,
+        logs: [],
         revertReason: reasonOf(err),
         failedCall: index + 1,
       }
@@ -156,6 +169,7 @@ async function legacy(
     gasUsed: gasUsed.toString(),
     assetChanges: [],
     tracedAssets: false,
+    logs: [],
   }
   return { provider: LEGACY_PROVIDER, ...conclusions, ranAt: now().toISOString(), raw: { resultHash: resultHashOf(conclusions) } }
 }

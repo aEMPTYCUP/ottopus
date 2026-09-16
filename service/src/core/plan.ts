@@ -178,6 +178,24 @@ export const assetDeltaSchema = z.strictObject({
 })
 
 /**
+ * One EVM log from a simulation run.
+ *
+ * Carried raw so the policy can decode Transfer events itself. The balance
+ * probes miss ERC-1155 (needs balanceOf(address,id)), tokens whose
+ * balanceOf reverts, and assets held through a contract; the logs name the
+ * from address outright, so they are the second evidence channel the custom
+ * tier needs (#100).
+ */
+export const simulationLogSchema = z.strictObject({
+  /** Contract that emitted the log, lowercase hex with 0x prefix. */
+  address: z.string().regex(/^0x[0-9a-f]{40}$/),
+  /** 32-byte topics, lowercase hex with 0x prefix. At least one (event sig). */
+  topics: z.array(z.string().regex(/^0x[0-9a-f]{64}$/)).min(1).max(4),
+  /** Non-indexed log data, lowercase hex with 0x prefix (may be "0x"). */
+  data: z.string().regex(/^0x[0-9a-f]*$/),
+})
+
+/**
  * One simulation run. A prediction, never a guarantee, and never from the
  * provider that built the route (invariant 4). Null on a plan whose chain no
  * simulator serves; a transfer can still be reviewed from its decoded intent.
@@ -210,6 +228,16 @@ export const simulationSchema = z.strictObject({
    * without it.
    */
   tracedAssets: z.boolean().optional(),
+  /**
+   * Raw EVM logs from the run, for the custom tier to decode Transfer events.
+   *
+   * Optional so simulations written before it existed parse too. #100 is
+   * where it gets a reader: balance probes cannot see ERC-1155 transfers,
+   * tokens whose balanceOf reverts, or assets held through a contract; the
+   * logs name the from address outright, so any asset in that list without a
+   * declared ceiling is a block.
+   */
+  logs: z.array(simulationLogSchema).optional(),
   /** Gas units the whole batch burned. */
   gasUsed: z.string().regex(/^[0-9]+$/),
   /** The same in dollars, or "unknown" when no price was to hand. */
@@ -307,6 +335,7 @@ export type PlanDraft = z.infer<typeof planDraftSchema>
 export type Plan = z.infer<typeof planSchema>
 export type DecodedAction = z.infer<typeof decodedActionSchema>
 export type Simulation = z.infer<typeof simulationSchema>
+export type SimulationLog = z.infer<typeof simulationLogSchema>
 export type AssetDelta = z.infer<typeof assetDeltaSchema>
 export type Call = z.infer<typeof callSchema>
 export type Warning = z.infer<typeof warningSchema>

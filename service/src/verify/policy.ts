@@ -23,6 +23,117 @@ import {
 import { KNOWN_ABI, KNOWN_BY_SELECTOR, PERMIT2_APPROVE } from './abi.js'
 
 /**
+ * ERC-20/721 Transfer(address,address,uint256) event signature.
+ * keccak256("Transfer(address,address,uint256)")
+ */
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+
+/**
+ * ERC-1155 TransferSingle(address,address,address,uint256,uint256) event signature.
+ * keccak256("TransferSingle(address,address,address,uint256,uint256)")
+ */
+const TRANSFER_SINGLE_TOPIC = '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f'
+
+/**
+ * ERC-1155 TransferBatch(address,address,address,uint256[],uint256[]) event signature.
+ * keccak256("TransferBatch(address,address,address,uint256[],uint256[])")
+ */
+const TRANSFER_BATCH_TOPIC = '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f'
+
+/**
+ * Decode a 32-byte topic as an address (last 20 bytes).
+ */
+function addressFromTopic(topic: string): string {
+  return '0x' + topic.slice(-40)
+}
+
+/**
+ * Decode a 32-byte topic as a uint256.
+ */
+function uintFromTopic(topic: string): bigint {
+  return BigInt(topic)
+}
+
+/**
+ * One asset that left the signing account, as seen in a Transfer log.
+ */
+interface TransferOut {
+  /** CAIP-19 asset id, or null for ERC-1155 (needs token id). */
+  assetId: string | null
+  /** ERC-1155 token id, or null for ERC-20/721. */
+  tokenId: string | null
+  /** Amount that left, in base units. */
+  amount: bigint
+  /** Contract that emitted the log. */
+  contract: string
+}
+
+/**
+ * Decode Transfer logs where `from` is the signing account.
+ *
+ * This is the second evidence channel the custom tier needs (#100). The
+ * balance probes miss ERC-1155 (needs balanceOf(address,id)), tokens whose
+ * balanceOf reverts, and assets held through a contract; the logs name the
+ * from address outright, so any asset in this list without a declared
+ * ceiling is a block.
+ */
+function transfersOutFromLogs(
+  logs: Array<{ address: string; topics: string[]; data: string }> | undefined,
+  signer: string,
+  chainId: string,
+): TransferOut[] {
+  if (!logs || logs.length === 0) return []
+  const signerLower = signer.toLowerCase()
+  const chain = chainId.split(':')[1] ?? chainId
+  const out: TransferOut[] = []
+
+  for (const log of logs) {
+    if (log.topics.length === 0) continue
+    const topic0 = log.topics[0]!.toLowerCase()
+
+    if (topic0 === TRANSFER_TOPIC && log.topics.length >= 3) {
+      // ERC-20/721 Transfer(from, to, value)
+      const from = addressFromTopic(log.topics[1]!).toLowerCase()
+      if (from !== signerLower) continue
+      const amount = uintFromTopic(log.topics[3] ?? '0x' + log.data.slice(2, 66).padStart(64, '0'))
+      out.push({
+        assetId: `eip155:${chain}/erc20:${log.address.toLowerCase()}`,
+        tokenId: null,
+        amount,
+        contract: log.address.toLowerCase(),
+      })
+    } else if (topic0 === TRANSFER_SINGLE_TOPIC && log.topics.length >= 4) {
+      // ERC-1155 TransferSingle(operator, from, to, id, value)
+      const from = addressFromTopic(log.topics[2]!).toLowerCase()
+      if (from !== signerLower) continue
+      const tokenId = uintFromTopic(log.topics[3]!).toString()
+      // value is in data (first 32 bytes)
+      const value = log.data.length >= 66 ? BigInt('0x' + log.data.slice(2, 66)) : 0n
+      out.push({
+        assetId: null, // ERC-1155 needs token id in the asset id
+        tokenId,
+        amount: value,
+        contract: log.address.toLowerCase(),
+      })
+    } else if (topic0 === TRANSFER_BATCH_TOPIC && log.topics.length >= 4) {
+      // ERC-1155 TransferBatch(operator, from, to, ids[], values[])
+      const from = addressFromTopic(log.topics[2]!).toLowerCase()
+      if (from !== signerLower) continue
+      // ids and values are in data as two dynamic arrays
+      // This is more complex; for now, flag it as an undeclared transfer
+      out.push({
+        assetId: null,
+        tokenId: 'batch',
+        amount: 1n, // Non-zero to trigger the check
+        contract: log.address.toLowerCase(),
+      })
+    }
+  }
+
+  return out
+}
+
+/**
  * Does this plan do what the intent says?
  *
  * The route provider, the agent and the decoder are all untrusted inputs, so
@@ -777,6 +888,36 @@ const customRules: Rule = (input) => {
       findings.push({ block: `the simulation shows ${name} leaving, which the declaration does not mention` })
     } else if (left > max) {
       findings.push({ block: `the simulation shows ${left} ${name} leaving, above the ${max} the declaration allows` })
+    }
+  }
+
+  // Second evidence channel: Transfer logs. The balance probes miss
+  // ERC-1155, reverting balanceOf, and contract-held assets; the logs name
+  // the from address outright, so any asset in this list without a declared
+  // ceiling is a block (#100).
+  const signer = parseAccountId(intent.fromAccount).address.toLowerCase()
+  const transfersOut = transfersOutFromLogs(simulation.logs, signer, simulation.chainId)
+  for (const transfer of transfersOut) {
+    // For ERC-20/721, check against the declared bounds
+    if (transfer.assetId) {
+      const max = bounds.get(transfer.assetId.toLowerCase())
+      if (max === undefined) {
+        findings.push({
+          block: `the simulation logs show ${transfer.contract} Transfer leaving the account (ERC-20/721), which the declaration does not mention`,
+        })
+      } else if (transfer.amount > max) {
+        findings.push({
+          block: `the simulation logs show ${transfer.amount} of ${transfer.contract} leaving, above the ${max} the declaration allows`,
+        })
+      }
+    } else {
+      // ERC-1155: the declaration format may not support token ids yet, so
+      // any ERC-1155 transfer out is a block until the declaration can name
+      // it. This is conservative, but safe: an undeclared ERC-1155 transfer
+      // is exactly what the balance probes cannot see.
+      findings.push({
+        block: `the simulation logs show ${transfer.contract} ERC-1155 Transfer${transfer.tokenId === 'batch' ? 'Batch' : ` (token ${transfer.tokenId})`} leaving the account, which the declaration cannot name yet`,
+      })
     }
   }
   return findings
