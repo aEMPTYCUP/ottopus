@@ -852,4 +852,81 @@ describe('an agent-authored plan', () => {
       expect(verdict).toMatchObject({ ok: false, reasons: [expect.stringMatching(/above the 1000 the declaration allows/)] })
     })
   })
+
+  /**
+   * Second evidence channel (#100): Transfer logs. The balance probes miss
+   * ERC-1155, reverting balanceOf, and contract-held assets; the logs name
+   * the from address outright, so any asset in that list without a declared
+   * ceiling is a block.
+   */
+  describe('Transfer logs as second evidence channel', () => {
+    // keccak256("Transfer(address,address,uint256)")
+    const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+    // keccak256("TransferSingle(address,address,address,uint256,uint256)")
+    const TRANSFER_SINGLE_TOPIC = '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f'
+
+    const padAddress = (addr: string) => '0x' + addr.slice(2).padStart(64, '0')
+    const padUint = (n: bigint) => '0x' + n.toString(16).padStart(64, '0')
+
+    const erc20TransferLog = (token: string, from: string, to: string, amount: bigint) => ({
+      address: token.toLowerCase(),
+      topics: [TRANSFER_TOPIC, padAddress(from), padAddress(to)],
+      data: padUint(amount),
+    })
+
+    const erc1155TransferSingleLog = (token: string, operator: string, from: string, to: string, id: bigint, amount: bigint) => ({
+      address: token.toLowerCase(),
+      topics: [TRANSFER_SINGLE_TOPIC, padAddress(operator), padAddress(from), padAddress(to)],
+      data: padUint(id) + padUint(amount).slice(2),
+    })
+
+    const withLogs = (logs: Array<{ address: string; topics: string[]; data: string }>) =>
+      ran({ tracedAssets: true, assetChanges: [], logs })
+
+    it('inks an ERC-20 Transfer leaving the signer that the declaration never mentioned', async () => {
+      const logs = [erc20TransferLog(WETH, ALICE, MALLORY, 1_000_000_000_000_000_000n)]
+      const verdict = await verifyCustom(intent({ expectedChanges: [], approvals: [] }), [call(PM, claimFees)], withLogs(logs))
+      expect(verdict.ok).toBe(false)
+      expect(verdict).toMatchObject({ reasons: expect.arrayContaining([expect.stringMatching(/Transfer leaving the account.*which the declaration does not mention/)]) })
+    })
+
+    it('passes an ERC-20 Transfer leaving the signer that the declaration declared', async () => {
+      const logs = [erc20TransferLog(USDC, ALICE, MALLORY, 500_000n)]
+      const verdict = await verifyCustom(
+        intent({ expectedChanges: [{ asset: `${CHAIN}/erc20:${USDC}`, maxOut: '1000000' }], approvals: [] }),
+        [call(PM, claimFees)],
+        withLogs(logs),
+      )
+      expect(verdict.ok).toBe(true)
+    })
+
+    it('inks an ERC-20 Transfer leaving the signer above the declared ceiling', async () => {
+      const logs = [erc20TransferLog(USDC, ALICE, MALLORY, 5_000_000n)]
+      const verdict = await verifyCustom(
+        intent({ expectedChanges: [{ asset: `${CHAIN}/erc20:${USDC}`, maxOut: '1000000' }], approvals: [] }),
+        [call(PM, claimFees)],
+        withLogs(logs),
+      )
+      expect(verdict.ok).toBe(false)
+      expect(verdict).toMatchObject({ reasons: expect.arrayContaining([expect.stringMatching(/leaving, above the 1000000 the declaration allows/)]) })
+    })
+
+    it('inks an ERC-1155 TransferSingle leaving the signer (declaration cannot name token ids yet)', async () => {
+      const logs = [erc1155TransferSingleLog(USDC, ALICE, ALICE, MALLORY, 1n, 10n)]
+      const verdict = await verifyCustom(intent({ expectedChanges: [], approvals: [] }), [call(PM, claimFees)], withLogs(logs))
+      expect(verdict.ok).toBe(false)
+      expect(verdict).toMatchObject({ reasons: expect.arrayContaining([expect.stringMatching(/ERC-1155 Transfer.*leaving the account.*declaration cannot name yet/)]) })
+    })
+
+    it('ignores a Transfer where from is not the signer', async () => {
+      const logs = [erc20TransferLog(WETH, MALLORY, ALICE, 1_000_000_000_000_000_000n)]
+      const verdict = await verifyCustom(intent({ expectedChanges: [], approvals: [] }), [call(PM, claimFees)], withLogs(logs))
+      expect(verdict).toEqual({ ok: true, warnings: [] })
+    })
+
+    it('passes when there are no logs at all', async () => {
+      const verdict = await verifyCustom(intent({ expectedChanges: [], approvals: [] }), [call(PM, claimFees)], ran({ tracedAssets: true, assetChanges: [] }))
+      expect(verdict).toEqual({ ok: true, warnings: [] })
+    })
+  })
 })
